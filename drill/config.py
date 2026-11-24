@@ -22,6 +22,12 @@ LEASE_TTL = int(os.environ.get("DRILL_LEASE_TTL", "30"))
 # 磁盘配额（字节），统计口径包含“已删除但仍被打开”的文件
 DISK_QUOTA_BYTES = int(os.environ.get("DRILL_DISK_QUOTA", str(1024 * 1024)))
 
+# 维护后重试流量限速：开启时每个模拟秒最多放行的 GET /api/catalog 次数
+# （普通放行 + 凭号预约重试共享这一配额；预约创建时即预占名额）
+CATALOG_RATE_PER_SECOND = int(os.environ.get("DRILL_CATALOG_RATE_PER_SECOND", "2"))
+# 限速开关默认关闭；目标路由（与 current.json 里的路由 path 一致）
+CATALOG_RATE_ROUTE = "/api/catalog"
+
 HOST = os.environ.get("DRILL_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DRILL_PORT", "8000"))
 

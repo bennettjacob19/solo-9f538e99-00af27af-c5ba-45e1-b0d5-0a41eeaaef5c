@@ -26,6 +26,7 @@
 | 生效未回包时中断，重启恢复租约和令牌 | 生效点之后回执与版本已在同一 SQLite 事务落库；可 `SIGKILL` 发布端，`/api/publisher/recover`（以及 Flask 启动钩子）读回 holder/token，补完 `applied=0` 的切换，标记失联任务 |
 | 同号重发返回原回执、不升版（即使原进程仍暂停） | `receipts.request_id` 主键幂等；`POST /api/publish` 先查回执，命中直接 `replayed:true` 返回原回执，不校验 token、不起进程、不升版 |
 | 页面显示版号 / 持有者 / 令牌 / 期限 / 拒绝原因 | 顶部租约卡、两张 worker 卡、任务表、版本表、回执表、事件 / 拒绝原因流，每秒轮询 |
+| `/api/catalog` 维护后重试限速（默认关闭） | 演练页限速卡开关；开启后每模拟秒最多 2 个 GET，普通请求扣“已放行 + 未兑预约”余量，耗尽返回 **429 + 预约号 + Retry-After**；支持填最早重试时刻、凭号重试、退号补位；同号并发只放一次；停用路由先返回 503 不发号；关闭即作废本轮预约 |
 | docker compose 启动 | `docker compose up --build` → http://localhost:8000 ，数据在命名卷 `gsb-drill-volume:/drill` |
 
 ---
@@ -67,17 +68,18 @@ Flask（app.py，threaded，单进程；演练台 + 网关 /gw/...）
 
 ```
 app.py                 Flask：页面 / 网关 / 全部演练 API
-drill/config.py        路径、TTL、配额、内置路由（环境变量可覆盖）
+drill/config.py        路径、TTL、配额、内置路由、限速配额（环境变量可覆盖）
 drill/db.py            SQLite schema、连接（WAL/busy_timeout）、模拟时钟、事件
 drill/lease.py         并发安全的 acquire / renew / fence_check
+drill/ratelimit.py     /api/catalog 限速：开关 / 预约 / 凭号兑现 / 退号 / O(1) 找空档
 drill/configstore.py   current.json 播种 / 读取（含 last-good 兜底）
 drill/disk.py          卷文件 + /proc 已删打开句柄扫描与唯一 inode 占用
 drill/runner.py        发布子进程拉起 / SIGCONT / SIGKILL / 回收 / 重置 / 恢复
 drill/publisher.py     发布端状态机（可独立成进程：暂停点、fencing、提交、切换）
-templates/index.html   演练页
-static/app.js          原生 JS（轮询、两 worker、任务操作、网关试发）
+templates/index.html   演练页（含限速卡）
+static/app.js          原生 JS（轮询、两 worker、任务操作、网关试发、限速交互）
 static/style.css       暗色控制台样式
-tests/selftest.py      100 项断言的端到端自测（stdlib client，自起真实服务）
+tests/selftest.py      392 项断言的端到端自测（stdlib client，自起真实服务）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -158,6 +160,40 @@ inode，但恢复后一样被 fencing 拒绝）。
 原因含 `write_failed` 与 `[ENOSPC] ...（演练注入）`；网关仍按 current.json 的
 旧完整版响应；故障是一次性的，再发一次即成功。
 
+### D. 维护后重试限速（/api/catalog）
+
+1. 在左列 **「①·补 /api/catalog 维护后重试限速」** 卡片勾选 **启用限速开关**
+   （默认关闭；开启即新轮次 `epoch`，每模拟秒配额 2）。
+2. 点 **试发 /api/catalog**：前两次 200，第三次得到 **429**，响应体带
+   `reservation_id`（`RSV-...`）、约定秒 `slot`，响应头带 `Retry-After`；
+   预约号会自动填入输入框。可在 **最早重试模拟时刻** 填一个未来秒，429 的预约
+   会跳过更早时段。
+3. 推进模拟时钟到约定秒，点 **凭号重试** → 200（`rate_limit.redeemed=true`）；
+   同号再试 → 409；未到约定秒 → 409 `reservation_not_due`。
+4. 点 **退号** 释放名额：未来秒的空位立刻可被新的 429 预约重新使用（补位）。
+5. 把 `/api/catalog` 发布进停用清单后，试发直接 **503**：不发预约号、不扣任何
+   预约；重新启用后恢复限速。
+6. 关闭开关：本轮未兑现预约全部 `cancelled`、计数与满额区间清空，再开启是新
+   `epoch`，旧号再用返回 409 `limiter_disabled`。
+
+#### 限速正确性与效率设计
+
+* **配额口径**：某秒占用 = `rl_passed`（已放行，含凭号兑现）+ 未兑预约数；
+  普通请求只在“占用 < 2”时放行。预约创建即预占名额，因此普通请求永远不会
+  挤掉已预约的重试。
+* **同号并发**：兑现走 `BEGIN IMMEDIATE` + 条件
+  `UPDATE ... WHERE status='reserved'`，行级校验保证同一预约号 6 个并发请求
+  恰好 1 个 200、其余 409。
+* **找空档 O(1)**：满额的连续秒合并记录在 `rl_full_runs`（闭区间，相邻自动
+  合并 / 退号自动拆分），找“下一秒起最早空档”只对候选秒做一次覆盖索引区间
+  探测，首个空档前至多命中 1 个区间——读取行数与连续满额秒数无关。自测在
+  81 个连续满秒后验证 `rl_full_runs` 仍只有 **1 行**，`EXPLAIN QUERY PLAN`
+  走 `COVERING INDEX`。
+* **不预建未来秒**：`rl_passed` 只在真实放行的秒建行；未来秒仅在被预约占满
+  时才出现在满额区间，未预约的未来秒任何表都没有行（自测断言未来秒行数为 0）。
+* **状态全在 SQLite**：开关、轮次、预约、计数、满额区间均落库，Flask / 容器
+  重启后行为不变；`/api/admin/reset` 会把开关恢复为默认关闭并开新一轮。
+
 ---
 
 ## 6. 实测结果（本仓库交付前真实执行）
@@ -168,30 +204,36 @@ inode，但恢复后一样被 fencing 拒绝）。
   `tests/selftest.py`（自找空闲端口、临时卷、支持硬重启服务）：
 
 ```text
-$ .venv/bin/python tests/selftest.py
+$ python3 tests/selftest.py
 ...
-全部通过：100 项断言
+全部通过：392 项断言
 ```
 
-  连续 3 轮均全绿。覆盖：网关 200/503/404 与版本头；8 线程并发申请恰一胜 +
+  连续多轮均全绿。覆盖：网关 200/503/404 与版本头；8 线程并发申请恰一胜 +
   A/B 并发；续租 / 错 token / 临界过期 / 过期后 token 递增；正常发布；
   `stage_half` 与 `before_switch` 两条完整接管剧本（T 状态、半写文件、
   token=2、B 两版、`/proc` 幽灵 inode、恢复被 fencing 拒、版号配置不变、
   幽灵释放、槽位约束）；生效未回包同号回放、强杀、recover、**SIGKILL 整个
   Flask 进程组后用同一卷硬重启**仍保留租约 / token / v3 配置 / 回执且同号回放；
   ENOSPC/EIO 写失败时网关不受影响。
+  **第 [8] 组限速专项**：默认关闭、2 次/模拟秒、429 带预约号与 Retry-After、
+  最早重试时刻（含非法值 400）、未到时 / 已兑现 / 未知号 / 过期号的拒绝码、
+  6 线程同号并发恰好兑现 1 次、退号补位与双退号 409、停用路由 503 不发号不扣
+  预约、关闭作废与 epoch 轮换、81 个连续满秒仍只有 1 条满额区间且未来秒零预建、
+  覆盖索引查询计划、远跳未来秒立即恢复余量。
 
-- 用 jsdom 加载真实页面并执行真实 `static/app.js`，对运行中的服务做交互冒烟：
+- 沙箱没有 jsdom，改用最小 DOM 桩加载真实 `static/app.js` 对运行中的服务做交互冒烟：
 
 ```text
-18/18 DOM checks passed
+13/13 DOM checks passed
 ```
 
-  包括租约 / token / 勾选框 / 任务 / 回执 / 磁盘渲染，真实点击“同号重发”
-  出现回放提示且不升版、点 +10s 时钟变 t=1010、试发 `/api/checkout`
-  渲染出 `HTTP 503` 与 `route_disabled`，且无 JS 运行时错误。`node --check` 通过。
+  包括限速卡状态徽章 / epoch 与配额渲染、当前秒余量、满额区间与预约表渲染，
+  真实触发开关切换、带 `earliest_retry` 试发、429 自动回填预约号、HTTP 429 与
+  Retry-After 渲染、凭号重试与退号请求，且无 JS 运行时错误。`node --check` 通过。
 
-- `docker-compose.yml` 已用 PyYAML 解析校验（服务 / 端口 / 命名卷 / init 正确）。
+- `docker-compose.yml` 已用 YAML 解析校验（服务 / 端口 / 命名卷 / init 正确）；
+  限速只新增 SQLite 表与 HTTP 端点，不改变卷布局与启动命令，compose 配置无需改动。
 
 ---
 
@@ -201,8 +243,8 @@ $ .venv/bin/python tests/selftest.py
    实跑，只做了 YAML 校验和 Dockerfile / compose 的静态核对；容器路径
    （`/drill/...`、`/proc` 扫描、SIGSTOP/SIGCONT）均按 Linux 常规环境编写，
    但仍建议在有 Docker 的机器上首跑确认一次。
-2. **没有真实浏览器 / 截图**：前端只通过 jsdom（无布局渲染）+ `node --check`
-   验证；视觉效果与窄屏适配未做像素级检查。
+2. **没有真实浏览器 / 截图**：沙箱无 jsdom，前端通过最小 DOM 桩加载真实
+   `app.js` + `node --check` 验证；视觉效果与窄屏适配未做像素级检查。
 3. Flask 用内置 dev server、**单进程 + threaded** 运行（演练工具定位）。
    子进程句柄表在进程内存里；若用多 worker gunicorn，信号管理会退化到仅靠
    SQLite 中的 pid（状态 / 恢复仍正确，但本仓库没有做多进程句柄共享）。
@@ -217,3 +259,7 @@ $ .venv/bin/python tests/selftest.py
 8. fencing 由发布端自觉执行 + SQLite 事务保证；它能挡住“本演练里恢复的旧
    发布进程”，但不是对任意恶意 / 绕过发布器的写入者做存储侧硬隔离。
 9. 没有加登录鉴权（本地演练台），请勿直接暴露到公网。
+10. 限速只作用于 `GET /api/catalog` 一条路由、按模拟秒计费；配额
+    `DRILL_CATALOG_RATE_PER_SECOND` 可配但页面不暴露修改入口。预约号是
+    `RSV-` 前缀的随机不可猜 ID，没有做独立鉴权，任何拿到号的请求都可在约定秒
+    兑现（演练定位）。历史轮次数据保留在库中便于观察，没有定时清理任务。

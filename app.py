@@ -20,7 +20,7 @@ from typing import Any
 
 from flask import Flask, jsonify, render_template, request, Response
 
-from drill import config, configstore, db, disk, lease, runner
+from drill import config, configstore, db, disk, lease, ratelimit, runner
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -107,6 +107,8 @@ def get_state():
         fault = db.kv_get(con, "fault_next_write", "") or ""
         next_token = int(db.kv_get(con, "next_token", "1"))
 
+    rl_state = ratelimit.snapshot()
+
     cfg, from_cache = configstore.load_current()
     try:
         disk_snap = disk.snapshot()
@@ -133,6 +135,7 @@ def get_state():
         events=events,
         fault_next_write=fault,
         pause_points=list(config.PAUSE_POINTS),
+        ratelimit=rl_state,
     )
 
 
@@ -377,6 +380,35 @@ def api_reset():
 
 
 # ---------------------------------------------------------------------------
+# /api/catalog 重试限速（默认关闭的开关；预约 / 凭号重试 / 退号）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/ratelimit/config")
+def api_ratelimit_config():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    return jsonify(ok=True, **ratelimit.set_enabled(enabled))
+
+
+@app.get("/api/ratelimit/state")
+def api_ratelimit_state():
+    return jsonify(ok=True, ratelimit=ratelimit.snapshot())
+
+
+@app.post("/api/ratelimit/cancel")
+def api_ratelimit_cancel():
+    data = request.get_json(silent=True) or {}
+    rid = (data.get("reservation_id") or "").strip()
+    if not rid:
+        return jsonify(ok=False, error_code="missing_reservation",
+                       error="reservation_id 必填"), 400
+    try:
+        return jsonify(ok=True, **ratelimit.cancel(rid))
+    except ratelimit.RateLimitError as exc:
+        return jsonify(ok=False, error_code=exc.code, error=exc.message, **exc.extra), exc.status
+
+
+# ---------------------------------------------------------------------------
 # 网关：/gw/... 只读本地卷 current.json
 # ---------------------------------------------------------------------------
 
@@ -421,6 +453,45 @@ def gateway(subpath: str = ""):
         resp.headers.update(headers)
         return resp
 
+    # /api/catalog 的维护后重试限速（默认关闭；仅作用于 GET）。
+    # 停用路由的 503 在前面已返回：停用时不发号、不扣预约。
+    rl_info: dict[str, Any] | None = None
+    if request.method == "GET" and route_path == config.CATALOG_RATE_ROUTE:
+        rid = request.headers.get("X-Reservation-Id") or request.args.get("reservation_id")
+        earliest_raw = request.args.get("earliest_retry")
+        earliest_retry: int | None = None
+        if earliest_raw not in (None, ""):
+            try:
+                earliest_retry = int(earliest_raw)
+            except (TypeError, ValueError):
+                resp = jsonify({
+                    "ok": False, "error": "invalid_earliest_retry",
+                    "message": "earliest_retry 必须是模拟秒整数",
+                    "path": route_path,
+                })
+                resp.status_code = 400
+                resp.headers.update(headers)
+                return resp
+        try:
+            if rid:
+                rl_info = ratelimit.admit_reservation(rid)
+            else:
+                rl_info = ratelimit.admit_normal(earliest_retry)
+        except ratelimit.RateLimitError as exc:
+            resp = jsonify({
+                "ok": False,
+                "error": exc.code,
+                "message": exc.message,
+                "path": route_path,
+                "config_version": version,
+                **exc.extra,
+            })
+            resp.status_code = exc.status
+            resp.headers.update(headers)
+            if exc.extra.get("retry_after") is not None:
+                resp.headers["Retry-After"] = str(exc.extra["retry_after"])
+            return resp
+
     # “其余照常”：模拟上游正常应答
     payload = {
         "ok": True,
@@ -432,6 +503,8 @@ def gateway(subpath: str = ""):
         "echo_json": request.get_json(silent=True),
         "timestamp_real": time.time(),
     }
+    if rl_info is not None:
+        payload["rate_limit"] = rl_info
     if route_path == "/":
         payload["gateway"] = "GSB drill gateway"
         payload["routes"] = cfg.get("routes", [])

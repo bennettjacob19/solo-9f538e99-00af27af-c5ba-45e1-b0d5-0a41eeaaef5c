@@ -93,6 +93,54 @@ CREATE TABLE IF NOT EXISTS events (
     request_id  TEXT,
     message     TEXT NOT NULL
 );
+
+-- ===========================================================================
+-- /api/catalog 维护后重试限速（开关默认关闭；状态全部在 SQLite，可跨重启）
+-- ===========================================================================
+
+-- 单行配置（id 恒为 1）：enabled 开关 + 轮次 epoch（关闭即作废本轮预约，epoch+1）
+CREATE TABLE IF NOT EXISTS rl_config (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled     INTEGER NOT NULL DEFAULT 0,
+    epoch       INTEGER NOT NULL DEFAULT 1,
+    updated_sim INTEGER NOT NULL,
+    updated_real REAL NOT NULL
+);
+
+-- 预约号：创建即预占 slot 秒的一个名额；每个预约号只能在约定秒兑现一次
+CREATE TABLE IF NOT EXISTS rl_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    epoch      INTEGER NOT NULL,          -- 所属轮次；开关关闭后旧轮次全部作废
+    slot       INTEGER NOT NULL,          -- 约定的模拟秒
+    status     TEXT NOT NULL,             -- reserved|redeemed|cancelled|expired
+    created_sim INTEGER NOT NULL,
+    redeemed_sim INTEGER,
+    updated_real REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rl_resv_slot
+    ON rl_reservations(epoch, slot, status);
+CREATE INDEX IF NOT EXISTS idx_rl_resv_status
+    ON rl_reservations(status, slot);
+
+-- 已放行的普通请求计数：只在真实放行的那一秒建行，绝不给“未预约的未来秒”预建
+CREATE TABLE IF NOT EXISTS rl_passed (
+    epoch      INTEGER NOT NULL,
+    slot       INTEGER NOT NULL,
+    passed     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (epoch, slot)
+);
+
+-- 已满额的连续秒区间（run）：把“找最早空档”变成索引上的一次区间探测，
+-- 读取的行数只与“命中的满额区间个数”有关（首个空档前至多 1 个 run 覆盖），
+-- 不随连续满额的秒数线性增长；未预约 / 未满的未来秒不会有任何记录。
+CREATE TABLE IF NOT EXISTS rl_full_runs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    epoch      INTEGER NOT NULL,
+    start_slot INTEGER NOT NULL,
+    end_slot   INTEGER NOT NULL           -- 闭区间
+);
+CREATE INDEX IF NOT EXISTS idx_rl_runs_lookup
+    ON rl_full_runs(epoch, start_slot, end_slot);
 """
 
 
@@ -131,6 +179,12 @@ def init_db() -> None:
         con.execute("INSERT OR IGNORE INTO kv(k, v) VALUES('next_token', '1')")
         # none | disk_full | io_error ：下一次正文写入时消费一次
         con.execute("INSERT OR IGNORE INTO kv(k, v) VALUES('fault_next_write', '')")
+        # 限速开关默认关闭
+        con.execute(
+            "INSERT OR IGNORE INTO rl_config(id, enabled, epoch, updated_sim, updated_real) "
+            "VALUES(1, 0, 1, ?, ?)",
+            (config.START_NOW, time.time()),
+        )
 
 
 # ---------- kv / clock ----------

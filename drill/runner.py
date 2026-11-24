@@ -217,6 +217,16 @@ def reset_all() -> None:
                 pass
     db.init_db()
     configstore_seed()
+    # init_db 只做 INSERT OR IGNORE；重置后把限速开关明确恢复为默认关闭 / 新一轮
+    with db.session() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT epoch FROM rl_config WHERE id=1").fetchone()
+        epoch = int(row["epoch"]) if row else 1
+        con.execute(
+            "UPDATE rl_config SET enabled=0, epoch=?, updated_sim=?, updated_real=? WHERE id=1",
+            (epoch + 1, db.sim_now(con), time.time()),
+        )
+        con.execute("COMMIT")
 
 
 def configstore_seed() -> None:

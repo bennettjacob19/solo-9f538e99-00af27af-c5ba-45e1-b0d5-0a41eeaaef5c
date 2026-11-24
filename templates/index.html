@@ -47,6 +47,28 @@
       <div id="gw-result" class="gw-result muted">尚未发送。停用路由会得到 <b>503</b>，其余路由由 mock 上游正常应答。</div>
     </div>
 
+    <div class="card" id="rl-card">
+      <h2>①·补 /api/catalog 维护后重试限速 <span class="hint">默认关闭；开启后每模拟秒最多 2 次，429 附预约号 + Retry-After</span></h2>
+      <div class="row">
+        <label class="switch-line"><input type="checkbox" id="rl-enabled"> <span>启用限速开关</span></label>
+        <span id="rl-status" class="badge"></span>
+        <span class="muted" id="rl-meta"></span>
+      </div>
+      <div class="row">
+        <label class="field-label" style="margin:0">最早重试模拟时刻（可空）</label>
+        <input id="rl-earliest" type="number" placeholder="例如 1050" style="width:110px">
+        <button id="rl-send" class="primary">试发 /api/catalog</button>
+        <button id="rl-retry">凭号重试</button>
+        <button id="rl-cancel" class="warn">退号</button>
+      </div>
+      <div class="row">
+        <label class="field-label" style="margin:0">预约号</label>
+        <input id="rl-resv" class="reqid" style="width:170px" placeholder="RSV-xxxx">
+      </div>
+      <div id="rl-result" class="gw-result muted">限速关闭时试发等于普通网关请求；开启后普通请求扣“已放行 + 未兑预约”的余量，用完返回 429 并自动填好预约号。</div>
+      <div id="rl-panel" style="margin-top:10px"></div>
+    </div>
+
     <div class="card">
       <h2>② 当前已发布配置（网关实际生效）</h2>
       <div id="config-summary"></div>

@@ -9,9 +9,12 @@
 5. 磁盘槽位约束 + “已删除但仍打开”幽灵文件 /proc 核算；
 6. 生效未回包：同号重发回放原回执、不升版（原进程仍暂停）；
 7. 强杀发布端 → recover 认回租约 / token；整服务重启后状态仍在并可回放；
-8. 写入故障（ENOSPC / EIO）不影响网关按最近完整配置响应。
+8. 写入故障（ENOSPC / EIO）不影响网关按最近完整配置响应；
+9. /api/catalog 重试限速：开关默认关闭、2 次/模拟秒、429 预约号 + Retry-After、
+   凭号重试 / 退号补位 / 同号并发只放一次 / 停用 503 不发号 / 关闭作废、
+   连续满秒下找空档 O(1) 且不预建未来秒。
 
-只用标准库（urllib + threading），由当前解释器启动 app.py（需要 Flask）。
+只用标准库（urllib + threading + sqlite3），由当前解释器启动 app.py（需要 Flask）。
 """
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -123,7 +127,8 @@ class Server:
             "DRILL_STATE_DIR": str(self.state_dir),
             "DRILL_PORT": str(self.port),
             "DRILL_LEASE_TTL": "30",
-            "PYTHONPATH": str(ROOT),
+            # 保留外部已有的 PYTHONPATH（例如沙箱里 Flask 装在独立目录）
+            "PYTHONPATH": str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
         })
         self.proc = subprocess.Popen(
             [sys.executable, str(ROOT / "app.py")],
@@ -176,7 +181,7 @@ class Server:
             "DRILL_STATE_DIR": str(self.state_dir),
             "DRILL_PORT": str(self.port),
             "DRILL_LEASE_TTL": "30",
-            "PYTHONPATH": str(ROOT),
+            "PYTHONPATH": str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
         })
         self.proc = subprocess.Popen(
             [sys.executable, str(ROOT / "app.py")],
@@ -537,6 +542,259 @@ def test_write_failure(s: Server):
     check("fault arm consumed (cleared)", s.c.state()["fault_next_write"] == "")
 
 
+def test_catalog_rate_limit(s: Server):
+    print("\n[8] /api/catalog 重试限速：开关 / 429 预约 / 凭号 / 退号 / 并发 / 503 / 作废 / O(1) 找空档")
+    reset(s)
+
+    def rl_state():
+        return s.c.get("/api/ratelimit/state")[2]["ratelimit"]
+
+    def catalog_get(qs="", headers=None):
+        url = "/gw/api/catalog" + qs
+        # Client.call 不支持自定义头，这里直接走 urllib
+        req = urllib.request.Request(s.c.base + url, method="GET")
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, dict(resp.headers), json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), json.loads(e.read().decode())
+
+    # ---- 8.0 默认关闭：行为与普通网关一致，state 里 enabled=False ----
+    rl = rl_state()
+    check("rate limit disabled by default", rl["enabled"] is False and rl["rate_per_second"] == 2)
+    st, _, _ = catalog_get()
+    check("catalog 200 while limiter off", st == 200)
+    st, _, d = s.c.post("/api/ratelimit/config", {"enabled": True})
+    check("enable returns new epoch", st == 200 and d["enabled"] is True and d["epoch"] >= 2)
+    rl = rl_state()
+    check("state shows enabled and current slot",
+          rl["enabled"] is True and rl["current_slot"]["remaining"] == 2
+          and rl["current_slot"]["slot"] == 1000)
+
+    # ---- 8.1 同秒 2 次放行，第 3 次 429，带预约号与 Retry-After ----
+    st1, _, b1 = catalog_get()
+    st2, h2, b2 = catalog_get()
+    st3, h3, b3 = catalog_get()
+    check("first two requests pass", st1 == 200 and st2 == 200)
+    check("third request 429", st3 == 429, str(st3))
+    check("429 carries reservation id and Retry-After",
+          b3.get("reservation_id", "").startswith("RSV-") and h3.get("Retry-After") == "1",
+          json.dumps(b3, ensure_ascii=False)[:200])
+    check("429 books next simulated second", b3["slot"] == 1001 and b3["sim_now"] == 1000)
+    check("passed payload echoes rate_limit info",
+          b1.get("rate_limit", {}).get("decision") == "passed")
+    rid1, slot1 = b3["reservation_id"], b3["slot"]
+    rl = rl_state()
+    check("current slot shows 2/2 used and zero remaining",
+          rl["current_slot"]["used"] == 2 and rl["current_slot"]["remaining"] == 0)
+    check("reservation visible in state snapshot",
+          any(r["reservation_id"] == rid1 and r["status"] == "reserved" for r in rl["reservations"]))
+
+    # ---- 8.2 未到时凭号 -> 409；推进到约定秒 -> 200 兑现；同号再试 -> 409 ----
+    st, _, b = catalog_get(f"?reservation_id={rid1}")
+    check("redeem before due -> 409 reservation_not_due",
+          st == 409 and b.get("error") == "reservation_not_due", str(b)[:160])
+    s.c.post("/api/clock/advance", {"seconds": slot1 - 1000})
+    st, hdr, b = catalog_get(f"?reservation_id={rid1}")
+    check("redeem on due second -> 200 redeemed",
+          st == 200 and b.get("rate_limit", {}).get("redeemed") is True
+          and b["rate_limit"]["reservation_id"] == rid1, str(b)[:160])
+    st, _, b = catalog_get(f"?reservation_id={rid1}")
+    check("same id second use -> 409 reservation_redeemed",
+          st == 409 and b.get("error") == "reservation_redeemed", str(b)[:160])
+    # 预约号也支持请求头传入（未到 / 未知号路径）
+    st, _, b = catalog_get(headers={"X-Reservation-Id": "RSV-not-exist"})
+    check("unknown reservation -> 404", st == 404 and b.get("error") == "reservation_not_found")
+    st, _, b = catalog_get(headers={"X-Reservation-Id": rid1})
+    check("header-based redeem also blocked after use", st == 409)
+
+    # ---- 8.3 同号并发：6 个并发请求恰好兑现一次 ----
+    # 先把本秒第二个名额用普通请求占掉，再制造一个新预约
+    st, _, _ = catalog_get()  # 本秒第 2 次放行（第 1 次是上面的兑现）
+    st, _, b = catalog_get()
+    check("second full -> 429 again", st == 429 and b["slot"] == 1002)
+    rid2 = b["reservation_id"]
+    s.c.post("/api/clock/advance", {"seconds": 1})  # t=1002
+    results2: list[tuple[int, dict]] = []
+    barrier = threading.Barrier(6)
+
+    def concurrent_redeem():
+        barrier.wait()
+        results2.append(catalog_get(f"?reservation_id={rid2}"))
+
+    ts = [threading.Thread(target=concurrent_redeem) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    redeemed = [1 for st, _, b in results2
+                if st == 200 and b.get("rate_limit", {}).get("redeemed")]
+    rejected = [1 for st, _, _ in results2 if st == 409]
+    check("concurrent same-id redeem: exactly one passes",
+          len(redeemed) == 1, f"redeemed={len(redeemed)}")
+    check("concurrent same-id redeem: other five get 409",
+          len(rejected) == 5, f"rejected={len(rejected)}")
+
+    # ---- 8.4 退号补位：未来秒退号后空位可被重新预约 ----
+    # t=1002：并发兑现只放了 1 个，还剩 1 个普通名额，先吃掉它
+    st, _, b0 = catalog_get()
+    check("one ordinary slot remains after single concurrent redeem",
+          st == 200 and b0.get("rate_limit", {}).get("decision") == "passed", str(st))
+    # 本秒已满；连发两个 429 把 t=1003 预约占满
+    st, _, ba = catalog_get()
+    st, _, bb = catalog_get()
+    check("two more 429 land on same next second",
+          st == 429 and ba["slot"] == 1003 and bb["slot"] == 1003
+          and ba["reservation_id"] != bb["reservation_id"], str((ba, bb))[:200])
+    rid_a, rid_b = ba["reservation_id"], bb["reservation_id"]
+    # 第三个 429 只能跳到 1004
+    st, _, bc = catalog_get()
+    check("fully booked next second pushes reservation further",
+          st == 429 and bc["slot"] == 1004, str(bc)[:160])
+    # 退掉 1003 的一个预约
+    st, _, d = s.c.post("/api/ratelimit/cancel", {"reservation_id": rid_a})
+    check("cancel future reservation releases slot",
+          st == 200 and d["released"] is True and d["future_slot"] is True and d["slot"] == 1003)
+    # 再 429 应补回 1003
+    st, _, bd = catalog_get()
+    check("refill: new reservation reuses freed future second",
+          st == 429 and bd["slot"] == 1003, str(bd)[:160])
+    # 退已退的号 -> 409
+    st, _, b = s.c.post("/api/ratelimit/cancel", {"reservation_id": rid_a})
+    check("double cancel -> 409", st == 409 and b.get("error_code") == "reservation_cancelled",
+          f"got st={st} b={json.dumps(b, ensure_ascii=False)[:200]}")
+    # 退另一个号（同样是未来秒）
+    st, _, d = s.c.post("/api/ratelimit/cancel", {"reservation_id": rid_b})
+    check("cancel second reservation ok", st == 200 and d["slot"] == 1003)
+
+    # ---- 8.5 最早重试时刻：跳过更早时段；非法值 400 ----
+    st, _, b = catalog_get("?earliest_retry=1050")
+    check("earliest_retry skips earlier slots", st == 429 and b["slot"] >= 1050, str(b)[:160])
+    st, _, b = catalog_get("?earliest_retry=999")
+    check("earliest_retry in the past -> 400", st == 400 and b.get("error") == "invalid_earliest_retry")
+    st, _, b = catalog_get("?earliest_retry=not-an-int")
+    check("non-integer earliest_retry -> 400", st == 400)
+
+    # ---- 8.6 停用路由 -> 503 优先，不发号也不扣预约 ----
+    acquire(s, "A")
+    st, d = publish(s, "A", 1, "req-rl-disable", ["/api/catalog"])
+    s.wait_status(d["run_id"], {"done"})
+    n_resv_before = len(rl_state()["reservations"])
+    st, h503, b = catalog_get()
+    check("disabled catalog route -> 503 before rate limiting",
+          st == 503 and b.get("error") == "route_disabled", str(st))
+    st2, _, _ = catalog_get()
+    check("disabled route consistently 503", st2 == 503)
+    n_resv_after = len(rl_state()["reservations"])
+    check("503 issues no reservation and consumes nothing",
+          n_resv_before == n_resv_after, f"{n_resv_before} -> {n_resv_after}")
+    # 重新启用路由
+    st, d = publish(s, "A", 1, "req-rl-enable", [])
+    s.wait_status(d["run_id"], {"done"})
+    st, _, _ = catalog_get()
+    check("catalog re-enabled goes through limiter again", st in (200, 429))
+
+    # ---- 8.7 关闭限速：本轮预约全部作废，再开是新 epoch；普通请求直接 200 ----
+    epoch_on = rl_state()["epoch"]
+    st, _, d = s.c.post("/api/ratelimit/config", {"enabled": False})
+    check("disable bumps epoch and reports changed",
+          st == 200 and d["enabled"] is False and d["epoch"] == epoch_on + 1)
+    rl = rl_state()
+    check("no live reservations after switch off",
+          all(r["status"] != "reserved" for r in rl["reservations"]))
+    st, _, _ = catalog_get()
+    check("catalog unrestricted once off", st == 200)
+    st, _, b = catalog_get(f"?reservation_id={rid2}")
+    check("old reservation rejected after void",
+          st == 409 and b.get("error") == "limiter_disabled", str(b)[:160])
+    st, _, b = s.c.post("/api/ratelimit/cancel", {"reservation_id": rid2})
+    check("cancel while disabled is a no-op release", st == 409)
+    st, _, d = s.c.post("/api/ratelimit/config", {"enabled": True})
+    check("re-enable starts a fresh epoch", st == 200 and d["epoch"] == epoch_on + 2)
+    rl = rl_state()
+    check("fresh epoch has no reservations", rl["reservations"] == [])
+
+    # ---- 8.8 连续满秒下找空档 O(1)：区间合并 + 不预建未来秒 ----
+    # 语义：普通请求只能用“扣掉已放行和未兑预约后的余量”，不能消费预约占住的名额。
+    # 冷启动秒：2 普通放行占满 + 2 个 429 预约下一秒；
+    # 后续秒：先凭号兑现上一秒的 2 个预约（占满本秒），普通请求全部 429 并预约下一秒。
+    rs0 = [catalog_get() for _ in range(4)]
+    check("cold second: 2 pass + 2 limited",
+          sorted(st for st, _, _ in rs0) == [200, 200, 429, 429])
+    pending = [b["reservation_id"] for st, _, b in rs0 if st == 429]
+    s.c.post("/api/clock/advance", {"seconds": 1})
+
+    def saturate_second(sec: int) -> None:
+        # 兑现上一秒预约，恰好占满本秒
+        for rid in pending:
+            rsc, _, rb = catalog_get(f"?reservation_id={rid}")
+            check(f"steady second {sec}: reservation redeemed on due second",
+                  rsc == 200 and rb.get("rate_limit", {}).get("redeemed") is True,
+                  f"{rsc} {rb.get('error')}")
+        # 本秒已被兑现占满：两个普通请求都应 429，并预约下一秒
+        limited = [catalog_get() for _ in range(2)]
+        check(f"steady second {sec}: ordinary requests all limited",
+              all(st == 429 for st, _, _ in limited), str([st for st, _, _ in limited]))
+        return [b["reservation_id"] for st, _, b in limited if st == 429]
+
+    for sec in range(40):
+        pending = saturate_second(sec)
+        s.c.post("/api/clock/advance", {"seconds": 1})
+    db_path = Path(s.state_dir) / "drill.db"
+    ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    ro.row_factory = sqlite3.Row
+    n_runs = ro.execute("SELECT COUNT(*) AS c FROM rl_full_runs").fetchone()["c"]
+    check("41 consecutive full seconds merge into ONE full-run row",
+          n_runs == 1, f"runs={n_runs}")
+    run = ro.execute("SELECT start_slot, end_slot FROM rl_full_runs").fetchone()
+    check("full run covers the whole saturated span",
+          run["end_slot"] - run["start_slot"] >= 40, dict(run))
+    n_future_passed = ro.execute(
+        "SELECT COUNT(*) AS c FROM rl_passed "
+        "WHERE slot > (SELECT CAST(v AS INTEGER) FROM kv WHERE k='sim_now')"
+    ).fetchone()["c"]
+    check("no rl_passed rows pre-created for future seconds", n_future_passed == 0)
+    n_future_runs = ro.execute(
+        "SELECT COUNT(*) AS c FROM rl_full_runs "
+        "WHERE start_slot > (SELECT CAST(v AS INTEGER) FROM kv WHERE k='sim_now')"
+    ).fetchone()["c"]
+    check("no full-run rows pre-created for future seconds", n_future_runs == 0)
+    plan = ro.execute(
+        "EXPLAIN QUERY PLAN SELECT * FROM rl_full_runs "
+        "WHERE epoch=? AND start_slot<=? AND end_slot>=? LIMIT 1",
+        (rl_state()["epoch"], 99999, 99999),
+    ).fetchall()
+    detail = " ".join(dict(p)["detail"] for p in plan)
+    check("free-slot probe uses the covering index (no full scan)",
+          "COVERING INDEX" in detail.upper(), detail)
+    # 再饱和 40 秒，区间仍然只有 1 行——读取量不随连续满秒数线性增长
+    for sec in range(40, 80):
+        pending = saturate_second(sec)
+        s.c.post("/api/clock/advance", {"seconds": 1})
+    n_runs2 = ro.execute("SELECT COUNT(*) AS c FROM rl_full_runs").fetchone()["c"]
+    check("81 full seconds still ONE run row (read size independent of saturated length)",
+          n_runs2 == 1, f"runs={n_runs2}")
+    n_expired = ro.execute(
+        "SELECT COUNT(*) AS c FROM rl_reservations WHERE status='expired'"
+    ).fetchone()["c"]
+    check("no reservation expired during correct steady-state redemption", n_expired == 0)
+    ro.close()
+
+    # 远跳未来：未预约秒立即有余量，429 只预约紧邻的下一秒
+    s.c.post("/api/clock/advance", {"seconds": 1000})
+    far = [catalog_get()[0] for _ in range(3)]
+    check("far future unused second: 200,200,429", far == [200, 200, 429], str(far))
+    st, _, b = catalog_get()
+    check("far future 429 books immediate next second",
+          st == 429 and b["retry_after"] == 1)
+
+    # 重置后开关恢复默认关闭
+    reset(s)
+    check("reset restores default-off limiter", rl_state()["enabled"] is False)
+    st, _, _ = catalog_get()
+    check("catalog free after reset", st == 200)
+
+
 def main():
     print(f"项目根: {ROOT}")
     s = Server()
@@ -550,6 +808,7 @@ def main():
         _takeover(s, "before_switch")
         test_idempotent_and_restart(s)
         test_write_failure(s)
+        test_catalog_rate_limit(s)
     except Exception:
         import traceback
         traceback.print_exc()

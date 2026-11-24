@@ -63,6 +63,7 @@ function renderAll() {
   renderReceipts();
   renderVersions();
   renderEvents();
+  renderRateLimit();
   $("fault-state").textContent = state.fault_next_write
     ? "已武装：" + state.fault_next_write
     : "无故障";
@@ -315,6 +316,119 @@ function renderEvents() {
     </div>`).join("");
 }
 
+/* ---------------- /api/catalog 重试限速 ---------------- */
+
+function renderRateLimit() {
+  const rl = state.ratelimit;
+  if (!rl) return;
+  const cb = $("rl-enabled");
+  if (cb.checked !== rl.enabled) cb.checked = rl.enabled;
+  const st = $("rl-status");
+  st.textContent = rl.enabled ? "限速开启" : "限速关闭（默认）";
+  st.className = "badge " + (rl.enabled ? "bad" : "ok");
+  $("rl-meta").textContent =
+    `轮次 epoch=${rl.epoch} · ${rl.rate_per_second} 次/模拟秒 · 路由 ${rl.route} · 当前 t=${rl.sim_now}`;
+
+  const cur = rl.current_slot;
+  const curHtml = cur ? `
+    <div class="lease-big" style="margin-bottom:6px">
+      <span class="badge info">当前秒 t=${cur.slot}</span>
+      <span class="mono">已放行 ${cur.passed}</span>
+      <span class="mono">未兑预约 ${cur.reserved_held}</span>
+      <span class="mono">占用 ${cur.used}/${cur.limit}</span>
+      <span class="badge ${cur.remaining > 0 ? "ok" : "bad"}">余量 ${cur.remaining}</span>
+    </div>` : '<div class="muted" style="margin-bottom:6px">限速关闭中，无秒级计数。</div>';
+
+  const runs = (rl.full_slots || []).map((r) =>
+    r.start === r.end ? `t=${r.start}` : `t=${r.start}~${r.end}`).join("，");
+  const resv = (rl.reservations || []);
+  const resvHtml = resv.length ? `<table class="data">
+      <thead><tr><th>预约号</th><th>约定秒</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${resv.map((r) => `
+        <tr>
+          <td class="mono">${esc(r.reservation_id)}</td>
+          <td class="mono">t=${esc(r.slot)}</td>
+          <td><span class="badge ${r.status === "reserved" ? "warn" : r.status === "redeemed" ? "ok" : ""}">${esc(r.status)}</span></td>
+          <td>${r.status === "reserved" ? `
+            <button class="act resend" data-rl-act="use" data-rid="${esc(r.reservation_id)}">凭号重试</button>
+            <button class="act kill" data-rl-act="cancel" data-rid="${esc(r.reservation_id)}">退号</button>` : ""}</td>
+        </tr>`).join("")}</tbody>
+    </table>` : '<div class="empty">本轮还没有预约。</div>';
+
+  $("rl-panel").innerHTML = curHtml +
+    `<label class="field-label">满额连续秒区间（找空档走索引，不随满秒数线性扫描；未满的未来秒无记录）</label>
+     <div class="mono muted" style="margin-bottom:6px">${runs || "（无满额区间）"}</div>` +
+    '<label class="field-label">本轮预约 / 兑现记录</label>' + resvHtml;
+}
+
+async function rlFetch(url, method, body) {
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+    return { status: res.status, headers: res.headers, data };
+  } catch (e) {
+    return { status: 0, headers: new Headers(), data: { error: "网络错误: " + e } };
+  }
+}
+
+function showRlResult(res) {
+  const box = $("rl-result");
+  const pretty = JSON.stringify(res.data, null, 2);
+  const cls = res.status < 300 ? "s-2" : res.status < 500 ? "s-4" : "s-5";
+  const ra = res.headers.get("Retry-After");
+  box.innerHTML =
+    `<div><span class="gw-status ${cls}">HTTP ${res.status}</span>` +
+    (ra ? `<span class="badge warn">Retry-After: ${esc(ra)}</span>` : "") +
+    (res.data?.reservation_id ? ` <span class="token-pill" style="font-size:14px">${esc(res.data.reservation_id)}</span>` : "") +
+    `</div><pre style="margin:8px 0 0;white-space:pre-wrap">${esc(pretty)}</pre>`;
+}
+
+async function rlSetEnabled(enabled) {
+  const r = await rlFetch("/api/ratelimit/config", "POST", { enabled });
+  if (r.status === 200) {
+    notice("ok", enabled ? "✅ /api/catalog 限速已开启（每模拟秒 2 次）" : "限速已关闭，本轮预约全部作废");
+  } else notice("err", "⛔ " + (r.data?.error || r.status));
+  refresh();
+}
+
+async function rlSend() {
+  const raw = $("rl-earliest").value.trim();
+  const qs = raw ? `?earliest_retry=${encodeURIComponent(Number(raw))}` : "";
+  const r = await rlFetch("/gw/api/catalog" + qs, "GET");
+  showRlResult(r);
+  if (r.data?.reservation_id) $("rl-resv").value = r.data.reservation_id;
+  if (r.status === 200) notice("ok", r.data?.rate_limit?.redeemed ? "凭号兑现放行" : "普通请求放行");
+  else if (r.status === 429) notice("err", `429：已预约 t=${r.data.slot}，预约号已填入，推进时钟到该秒后凭号重试`, 9000);
+  else notice("err", "⛔ " + (r.data?.message || r.status), 9000);
+  refresh();
+}
+
+async function rlRedeem(rid) {
+  const id = (rid ?? $("rl-resv").value).trim();
+  if (!id) return notice("err", "请先填写或选择预约号");
+  const r = await rlFetch(`/gw/api/catalog?reservation_id=${encodeURIComponent(id)}`, "GET");
+  showRlResult(r);
+  if (r.status === 200) notice("ok", `🎟 预约号 ${id} 已在约定秒兑现放行`);
+  else notice("err", "⛔ " + (r.data?.message || r.status), 9000);
+  refresh();
+}
+
+async function rlCancel(rid) {
+  const id = (rid ?? $("rl-resv").value).trim();
+  if (!id) return notice("err", "请先填写或选择预约号");
+  const r = await rlFetch("/api/ratelimit/cancel", "POST", { reservation_id: id });
+  showRlResult(r);
+  if (r.status === 200) notice("ok", `退号成功：${id}${r.data.future_slot ? "（未来秒空位已释放，可重新预约）" : ""}`);
+  else notice("err", "⛔ " + (r.data?.error || r.status), 9000);
+  refresh();
+}
+
 /* ---------------- 数据刷新 ---------------- */
 
 async function refresh() {
@@ -502,6 +616,18 @@ $("recover-btn").addEventListener("click", async () => {
 });
 $("gw-send").addEventListener("click", sendGateway);
 $("gw-route").addEventListener("change", () => {});
+
+$("rl-enabled").addEventListener("change", () => rlSetEnabled($("rl-enabled").checked));
+$("rl-send").addEventListener("click", rlSend);
+$("rl-retry").addEventListener("click", () => rlRedeem());
+$("rl-cancel").addEventListener("click", () => rlCancel());
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-rl-act]");
+  if (!btn || !$("rl-panel").contains(btn)) return;
+  const rid = btn.getAttribute("data-rid");
+  if (btn.getAttribute("data-rl-act") === "use") return rlRedeem(rid);
+  if (btn.getAttribute("data-rl-act") === "cancel") return rlCancel(rid);
+});
 
 refresh();
 setInterval(refresh, 1000);
